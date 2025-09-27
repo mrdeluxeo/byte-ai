@@ -5,7 +5,26 @@ const dotenv = require('dotenv');
 const { JSDOM } = require('jsdom');
 const { Readability } = require('@mozilla/readability');
 const cheerio = require('cheerio');
-const OpenAI = require('openai');
+// OpenAI SDK compatibility wrapper: support multiple versions of the openai package
+let OpenAIClientFactory = null;
+try {
+  // Try newer SDK (v3+)
+  const OpenAI = require('openai');
+  if (OpenAI && typeof OpenAI.OpenAI === 'function') {
+    // v4 style: new OpenAI({ apiKey }) -> client
+    OpenAIClientFactory = (apiKey) => new OpenAI.OpenAI({ apiKey });
+  } else if (OpenAI && typeof OpenAI === 'function') {
+    // older export style where require('openai') returns a constructor
+    OpenAIClientFactory = (apiKey) => new OpenAI({ apiKey });
+  } else if (OpenAI && OpenAI.Configuration && OpenAI.OpenAIApi) {
+    // older v3 style: Configuration + OpenAIApi
+    const { Configuration, OpenAIApi } = OpenAI;
+    OpenAIClientFactory = (apiKey) => new OpenAIApi(new Configuration({ apiKey }));
+  }
+} catch (e) {
+  // If require fails, leave factory null and handle later
+  OpenAIClientFactory = null;
+}
 
 dotenv.config();
 
@@ -32,51 +51,62 @@ if (GOOGLE_CX && GOOGLE_CX.includes('cx=')) {
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 let openai = null;
-// Initialize OpenAI client robustly for different SDK shapes
-if (OPENAI_KEY) {
-  // Try v4 default export: new OpenAI({ apiKey })
+if (process.env.OPENAI_API_KEY && OpenAIClientFactory) {
   try {
-    openai = new OpenAI({ apiKey: OPENAI_KEY });
-    openai.isV4 = true;
+    openai = OpenAIClientFactory(process.env.OPENAI_API_KEY);
   } catch (e) {
-    // Try named export: OpenAI.OpenAI
-    try {
-      if (OpenAI && typeof OpenAI.OpenAI === 'function') {
-        openai = new OpenAI.OpenAI({ apiKey: OPENAI_KEY });
-        openai.isV4 = true;
-      }
-    } catch (e2) {
-      // Try legacy SDK shape with Configuration/OpenAIApi
-      try {
-        const Configuration = OpenAI.Configuration;
-        const OpenAIApi = OpenAI.OpenAIApi || OpenAI.OpenaiApi || OpenAI.OpenAIAPI;
-        if (typeof Configuration === 'function' && typeof OpenAIApi === 'function') {
-          const conf = new Configuration({ apiKey: OPENAI_KEY });
-          openai = new OpenAIApi(conf);
-          openai.isV4 = false;
-        }
-      } catch (e3) {
-        // give up — openai stays null
-        openai = null;
-      }
+    console.error('Failed to create OpenAI client using compatibility wrapper:', e && e.message ? e.message : e);
+    openai = null;
+  }
+} else if (process.env.OPENAI_API_KEY && !OpenAIClientFactory) {
+  console.warn('OPENAI_API_KEY set but OpenAI SDK not found or unsupported. Install official openai package.');
+}
+
+// Detect which OpenAI client shape we have and choose a call mode
+let openaiMode = null; // 'chat.completions.create' | 'createChatCompletion' | null
+if (openai) {
+  try {
+    if (openai.chat && openai.chat.completions && typeof openai.chat.completions.create === 'function') {
+      openaiMode = 'chat.completions.create';
+    } else if (typeof openai.createChatCompletion === 'function') {
+      openaiMode = 'createChatCompletion';
+    } else if (openai.responses && typeof openai.responses.create === 'function') {
+      // some newer SDKs expose responses API; prefer chat-compatible paths above, but mark responses as fallback
+      openaiMode = 'responses.create';
     }
+  } catch (e) {
+    openaiMode = null;
   }
 }
 
 async function callChatCompletion(messages, max_tokens = 500, model = 'gpt-4o-mini') {
   if (!openai) throw new Error('OpenAI client not configured');
-  if (openai.isV4) {
-    // new SDK: openai.chat.completions.create
+  if (openaiMode === 'chat.completions.create') {
     const resp = await openai.chat.completions.create({ model, messages, max_tokens });
-    // prefer choices[0].message.content
     if (resp && resp.choices && resp.choices[0]) {
       return (resp.choices[0].message && resp.choices[0].message.content) || (resp.choices[0].delta && resp.choices[0].delta.content) || '';
     }
     return '';
-  } else {
+  }
+  if (openaiMode === 'createChatCompletion') {
     const resp = await openai.createChatCompletion({ model, messages, max_tokens });
     return resp.data && resp.data.choices && resp.data.choices[0] && resp.data.choices[0].message ? resp.data.choices[0].message.content : '';
   }
+  if (openaiMode === 'responses.create') {
+    // Fallback to responses API: convert messages to a single input string.
+    // This is a best-effort mapping; responses API supports richer usage but may differ.
+    const joined = messages.map(m => (m.role ? m.role + ': ' : '') + (m.content || '')).join('\n');
+    const resp = await openai.responses.create({ model, input: joined, max_tokens });
+    if (resp && resp.output && resp.output.length) {
+      // output can be an array of message objects or text
+      const out = resp.output.find(o => o.content && o.content[0] && o.content[0].text);
+      if (out) return out.content[0].text;
+      if (typeof resp.output[0] === 'string') return resp.output[0];
+    }
+    return '';
+  }
+
+  throw new Error('OpenAI client does not support chat completion methods. Install a compatible openai SDK version.');
 }
 
 function isGreeting(text) {
