@@ -276,8 +276,36 @@
         addMessage('Thinking...', 'ai');
         try {
           const res = await fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) });
-          const json = await res.json();
-          if (!res.ok) throw new Error(json.error || 'Unknown');
+          // Defensive parsing: some hosting (or error responses) may return empty body or non-JSON
+          let json = null;
+          const ct = res.headers.get('content-type') || '';
+          if (ct.includes('application/json')) {
+            try {
+              json = await res.json();
+            } catch (parseErr) {
+              // JSON parse failed
+              const text = await res.text();
+              throw new Error('Invalid JSON response from server: ' + (text ? text : parseErr.message));
+            }
+          } else {
+            // Not JSON: try to read text and present it
+            const txt = await res.text();
+            if (!res.ok) throw new Error(txt || `Server returned ${res.status}`);
+            try {
+              json = txt ? JSON.parse(txt) : null;
+            } catch (e2) {
+              // If successful 200 but non-JSON, show the raw text as the answer
+              const lastAI = Array.from(messages.querySelectorAll('.message.ai')).pop();
+              if (lastAI) messages.removeChild(lastAI);
+              addMessage(txt || 'Empty response from server', 'ai');
+              return;
+            }
+          }
+
+          if (!res.ok) {
+            throw new Error((json && (json.error || json.message)) || `Server returned ${res.status}`);
+          }
+
           // Remove the last AI 'Thinking...' message (if present)
           const lastAI = Array.from(messages.querySelectorAll('.message.ai')).pop();
           if (lastAI) messages.removeChild(lastAI);
