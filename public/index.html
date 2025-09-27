@@ -275,7 +275,7 @@
         textarea.value = '';
         addMessage('Thinking...', 'ai');
         try {
-          const res = await fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) });
+          const res = await fetch('/.netlify/functions/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) });
           // Defensive parsing: some hosting (or error responses) may return empty body or non-JSON
           let json = null;
           const ct = res.headers.get('content-type') || '';
